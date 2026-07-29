@@ -51,6 +51,33 @@
   and the LST fallback so both paths select the same files. Specialized parsers take precedence: a
   file a real parser claims, such as `Dockerfile*` for `DockerParser`, is never treated as plain
   text on the LST path. See also **Specialized ownership**.
+- **Recipe artifact resolution**: Fetching the coordinates named by `--recipe-artifact` so their JARs
+  exist locally. Who performs it depends on the stage and they do not share a cache: on the LST path
+  rewrite-runner resolves them itself into its own recipe cache, while on
+  [[#stage-0-plugin-first-execution]] the target project's own build tool resolves them from whatever
+  repositories that build can see. _Avoid_: using "recipe discovery" for this step.
+- **Recipe discovery**: Finding a named recipe among JARs that are already present, by scanning them
+  for recipe classes and `META-INF/rewrite/*.yml` definitions. Distinct from **recipe artifact
+  resolution**: a recipe is undiscoverable both when its artifact was never fetched and when the
+  fetched artifact is unreadable, and the two are reported identically as "recipe not found".
+- **Terminal execution failure**: A failure that ends a run after execution has begun. Always
+  reported by returning a result that carries the failure, the record of every stage that ran, and
+  any changes that legitimately landed before it — never by throwing. A run can fail and still have
+  changed files, and the result must be able to say both. Contrast **precondition error**. See
+  [[0012-uniform-failure-reporting]].
+- **Precondition error**: An invalid request detected before any execution begins, such as a project
+  directory that does not exist. Always thrown, never reported as a run outcome, because no run
+  occurred.
+- **Unresolved recipe**: A recipe a run needs but the executing environment cannot find — either the
+  recipe the user requested, or one named inside a requested [[#declarative-recipe]]'s recipe list.
+  Any unresolved recipe makes the run a failure; a run must never quietly execute the subset it
+  happened to find. Because each stage resolves from its own sources, a recipe unresolved in one
+  stage may be resolvable in another, so an unresolved recipe is grounds for falling through to a
+  later stage rather than for abandoning the run. See [[0011-unresolved-recipes-are-failures]].
+- **Declarative recipe**: A recipe defined in YAML rather than as a class, whose `recipeList` may name
+  recipes belonging to other artifacts. Discovering one requires its own artifact; initializing one
+  requires every artifact its list names, and a missing entry degrades the recipe silently instead of
+  failing discovery.
 - **Root descriptor**: A build descriptor at the project root: `pom.xml` for Maven, or
   `settings.gradle(.kts)` / `build.gradle(.kts)` for Gradle.
 - **Root-less monorepo**: A repository whose project root has no build descriptor for a tool, but one
