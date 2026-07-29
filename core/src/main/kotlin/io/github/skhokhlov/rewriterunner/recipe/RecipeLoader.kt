@@ -10,6 +10,7 @@ import java.net.URI
 import java.net.URLClassLoader
 import java.nio.file.Path
 import java.util.Properties
+import java.util.jar.JarEntry
 import java.util.jar.JarFile
 import kotlin.io.path.exists
 import kotlin.io.path.isDirectory
@@ -132,13 +133,34 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
      * recipes the corrupt JAR was supposed to supply — the unresolved-recipe failure
      * raised by [unresolvedRecipeNames], which blames the recipe names rather than the file.
      *
-     * This probe mirrors exactly what the scanner will do — directories are scanned as
-     * exploded class/resource trees and are therefore accepted as-is; every regular file
-     * must open as a ZIP/JAR archive — and fails loudly, naming the offending path.
+     * This probe mirrors what the scanner will do — directories are scanned as exploded
+     * class/resource trees and are therefore accepted as-is; every regular file must open
+     * as a ZIP/JAR archive and yield readable recipe definitions — and fails loudly,
+     * naming the offending path.
      *
      * It must stay the **first** statement of [buildAndActivate]: both downstream failures
      * above are real diagnoses of their own conditions, so whichever check runs first
      * decides which cause the user is told about, and the corrupt file is the root cause.
+     *
+     * ## Known gap: corrupt `.class` entries are not detected
+     *
+     * Only the `.yml` and `.yaml` entries under `META-INF/rewrite/` are drained — exactly what
+     * upstream reads eagerly in `addYamlResourcesFromJar` to discover **declarative** recipes. Damage
+     * confined to a `.class` entry is not caught here, and upstream swallows it per entry
+     * as well (`catch (IOException | IllegalArgumentException ignored)` around
+     * `jarFile.getInputStream(entry)` in `buildSuperclassMapFromPath`), so an **imperative**
+     * recipe can still be dropped silently.
+     *
+     * That is a deliberate cost trade rather than an oversight. Decompressing every entry of
+     * every recipe JAR — a realistic run resolves ~95 of them, thousands of class files each,
+     * plus multi-megabyte resources such as `rewrite-spring`'s `classpath.tsv.gz` — would add
+     * seconds to every invocation to catch a failure mode that truncation cannot even produce:
+     * truncation destroys the central directory, which is written last, and that is already
+     * caught by the [JarFile] constructor.
+     *
+     * Draining is in any case not a complete check: [java.util.zip.ZipFile] does not verify
+     * entry CRCs, so corruption that still inflates without error is invisible no matter how
+     * much of the archive is read.
      */
     private fun verifyReadableArchives(recipeJars: List<Path>) {
         for (jar in recipeJars) {
@@ -157,20 +179,44 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
      *   when it is usable.
      */
     private fun archiveProblem(entry: Path): String? {
+        // Existence and readability are checked before the directory short-circuit: an
+        // exploded recipe directory that exists but cannot be read is just as unusable as
+        // an unreadable JAR, and upstream's Files.walk over it would silently yield nothing.
+        if (!entry.exists()) return "file does not exist"
+        if (!entry.isReadable()) return "file is not readable"
         // ClasspathScanningLoader walks directories of class files / META-INF resources,
         // so an exploded classpath entry is legitimate and needs no archive probe.
         if (entry.isDirectory()) return null
-        if (!entry.exists()) return "file does not exist"
-        if (!entry.isReadable()) return "file is not readable"
         return try {
-            // The JarFile constructor reads the ZIP central directory, which is precisely
-            // the structure a truncated download destroys.
-            JarFile(entry.toFile()).use { it.entries() }
+            JarFile(entry.toFile()).use { jar ->
+                // The JarFile constructor reads the ZIP central directory, which is precisely
+                // the structure a truncated download destroys.
+                //
+                // Draining the recipe definitions then covers damage confined to the
+                // entry-data region, which leaves that central directory intact — a local
+                // header or deflate stream broken by a partial overwrite rather than a
+                // truncation. See the "Known gap" note on verifyReadableArchives for what
+                // this deliberately does not cover.
+                jar.entries()
+                    .asSequence()
+                    .filter { candidate -> isRecipeDefinition(candidate) }
+                    .forEach { definition ->
+                        jar.getInputStream(definition).use { stream -> stream.readBytes() }
+                    }
+            }
             null
         } catch (e: IOException) {
             "not a readable archive: ${e.message ?: e.javaClass.simpleName}"
         }
     }
+
+    /**
+     * Mirrors the entry filter in upstream `ClasspathScanningLoader.addYamlResourcesFromJar`,
+     * which reads exactly these entries eagerly to discover declarative recipes.
+     */
+    private fun isRecipeDefinition(entry: JarEntry): Boolean = !entry.isDirectory &&
+        entry.name.startsWith(RECIPE_RESOURCE_PREFIX) &&
+        (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml"))
 
     private fun buildAndActivate(
         recipeJars: List<Path>,
@@ -290,5 +336,8 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
          * `<recipe name>.recipeList[<index>] (in <source>)`.
          */
         const val RECIPE_LIST_ENTRY_PROPERTY = ".recipeList["
+
+        /** JAR path prefix under which upstream looks for declarative recipe definitions. */
+        const val RECIPE_RESOURCE_PREFIX = "META-INF/rewrite/"
     }
 }

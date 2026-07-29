@@ -7,6 +7,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardOpenOption
 import java.util.jar.JarEntry
+import java.util.jar.JarFile
 import java.util.jar.JarOutputStream
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -16,6 +17,25 @@ import org.openrewrite.InMemoryExecutionContext
 import org.openrewrite.internal.InMemoryLargeSourceSet
 import org.openrewrite.text.PlainText
 import org.openrewrite.text.PlainTextParser
+
+/**
+ * Whether "make this unreadable" is actually enforceable here. False on Windows (whose ACLs
+ * ignore the POSIX-style bits `File.setReadable` sets) and when running as root, which bypasses
+ * permission checks entirely — in both cases a test that asserts an unreadable path is rejected
+ * would pass or fail for the wrong reason, so it is disabled rather than weakened.
+ */
+private val unreadablePathsAreEnforceable: Boolean by lazy {
+    val probe = Files.createTempDirectory("rlt-perm-probe-")
+    try {
+        probe.toFile().setReadable(false, false)
+        !Files.isReadable(probe)
+    } catch (_: Exception) {
+        false
+    } finally {
+        probe.toFile().setReadable(true, false)
+        probe.toFile().deleteRecursively()
+    }
+}
 
 class RecipeLoaderTest :
     FunSpec({
@@ -212,6 +232,38 @@ class RecipeLoaderTest :
             return target
         }
 
+        /**
+         * Overwrite the compressed-data region of the single entry in [jar] with zeroes,
+         * leaving its local header, the central directory and the end-of-central-directory
+         * record byte-for-byte intact.
+         *
+         * This is the corruption a partial overwrite produces, and it is the complement of
+         * truncation: the ZIP tail — written last, and what `JarFile`'s constructor reads —
+         * still describes a perfectly well-formed archive, so the damage is only observable
+         * by actually reading entry data.
+         *
+         * Verified empirically to raise `ZipException: invalid stored block lengths` on drain.
+         * Not every mutation does: flipping the *first* byte of the deflate stream in this same
+         * fixture still inflates cleanly, because `ZipFile` does not verify entry CRCs. Hence
+         * the deterministic whole-region zeroing rather than a byte flip.
+         */
+        fun corruptEntryData(jar: Path) {
+            val bytes = Files.readAllBytes(jar)
+            fun u16(at: Int) =
+                (bytes[at].toInt() and 0xFF) or ((bytes[at + 1].toInt() and 0xFF) shl 8)
+            // Local file header: 30 fixed bytes, then the name and extra fields.
+            val dataStart = 30 + u16(26) + u16(28)
+            val centralDirectory =
+                (bytes.size - 4 downTo 0).firstOrNull { i ->
+                    bytes[i] == 0x50.toByte() &&
+                        bytes[i + 1] == 0x4B.toByte() &&
+                        bytes[i + 2] == 0x01.toByte() &&
+                        bytes[i + 3] == 0x02.toByte()
+                } ?: error("no central directory file header found in $jar")
+            for (i in dataStart until centralDirectory) bytes[i] = 0
+            Files.write(jar, bytes)
+        }
+
         test("load activates a declarative recipe packaged in a readable recipe JAR") {
             // Positive control for the readability probe: a well-formed JAR must still load.
             val jar = writeRecipeJar(tempDir.resolve("good-recipe.jar"))
@@ -306,6 +358,42 @@ class RecipeLoaderTest :
             )
         }
 
+        test("load fails when entry data is damaged but the central directory is intact") {
+            // The JarFile constructor alone cannot see this: it reads the central directory,
+            // which a partial overwrite leaves untouched. Only reading the recipe definitions
+            // exposes it — and upstream's read is inside `catch (IOException ignored)`, so
+            // without this check the JAR would again contribute zero recipes silently.
+            val jar = writeRecipeJar(tempDir.resolve("damaged-entry.jar"))
+            corruptEntryData(jar)
+
+            // Guard that this fixture exercises the drain rather than the constructor: if the
+            // archive were structurally broken the constructor would throw and the test would
+            // pass without proving anything about entry data.
+            JarFile(jar.toFile()).use { opened ->
+                assertTrue(
+                    opened.entries().asSequence().any { it.name.endsWith("test-recipes.yml") },
+                    "Fixture must keep the central directory intact so the entry is still listed"
+                )
+            }
+
+            val ex =
+                runCatching {
+                    RecipeLoader(NoOpRunnerLogger).use { loader ->
+                        loader.load(
+                            recipeJars = listOf(jar),
+                            activeRecipeName = jarRecipeName,
+                            rewriteYaml = null as Path?
+                        )
+                    }
+                }.exceptionOrNull()
+
+            assertNotNull(ex, "A JAR whose recipe definitions cannot be read must fail the run")
+            assertTrue(
+                (ex.message ?: "").contains("damaged-entry.jar"),
+                "Failure must name the damaged JAR; got: ${ex.message}"
+            )
+        }
+
         test("load fails and names the file when a recipe JAR path does not exist") {
             val missing = tempDir.resolve("never-downloaded.jar")
 
@@ -326,6 +414,41 @@ class RecipeLoaderTest :
                 "Failure must name the missing JAR; got: ${ex.message}"
             )
         }
+
+        test("load fails and names the directory when an exploded classpath entry is unreadable")
+            .config(enabled = unreadablePathsAreEnforceable) {
+                // A directory that exists but cannot be read is as unusable as a corrupt JAR:
+                // upstream's Files.walk over it fails into `catch (IOException ignored)` and
+                // contributes nothing. The probe must therefore check readability *before* it
+                // short-circuits on isDirectory().
+                val dir = tempDir.resolve("unreadable-exploded")
+                val rewriteDir = dir.resolve("META-INF/rewrite")
+                Files.createDirectories(rewriteDir)
+                Files.writeString(rewriteDir.resolve("test-recipes.yml"), recipeYaml(jarRecipeName))
+                dir.toFile().setReadable(false, false)
+
+                try {
+                    val ex =
+                        runCatching {
+                            RecipeLoader(NoOpRunnerLogger).use { loader ->
+                                loader.load(
+                                    recipeJars = listOf(dir),
+                                    activeRecipeName = jarRecipeName,
+                                    rewriteYaml = null as Path?
+                                )
+                            }
+                        }.exceptionOrNull()
+
+                    assertNotNull(ex, "An unreadable classpath directory must fail the run")
+                    assertTrue(
+                        (ex.message ?: "").contains("unreadable-exploded"),
+                        "Failure must name the unreadable directory; got: ${ex.message}"
+                    )
+                } finally {
+                    // Restore readability or afterEach cannot clean the temp directory up.
+                    dir.toFile().setReadable(true, false)
+                }
+            }
 
         test("load accepts a directory classpath entry") {
             // ClasspathScanningLoader supports directories of class files / resources,
