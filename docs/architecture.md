@@ -58,6 +58,19 @@ See [ADR 0005](adr/0005-stage0-specialized-parser-ownership.md).
 
 If plugin execution is skipped or fails (no build file, non-zero exit, process start failure, timeout, missing recipe/plugin), the coordinator starts a `FULL_FALLBACK` worker. A full-fallback worker failure is terminal and is never retried in-process. `--skip-plugin-run` / `Builder.skipPluginRun(true)` bypasses Stage 0.
 
+**Stage 0 verifies its own success.** Exit code 0 is not proof the plugin ran the whole recipe: when
+a declarative recipe's `recipeList` names a recipe that is not on the plugin's classpath, upstream
+logs the gap at ERROR (`failOnInvalidActiveRecipes` defaults to `false`), executes only the entries
+it could resolve, and exits 0 with real patches. `DirectPluginExecutor` therefore inspects captured
+plugin output for upstream's unresolved-recipe markers immediately after the dry-run — **before**
+the diff check and before the apply goal — and returns `PluginRunResult.Failed` naming the
+unresolved recipes. Because the two stages resolve recipe artifacts from independent sources, that
+routes to the LST fallback, which may hold the artifact Stage 0 could not reach; failing before
+apply also keeps a partial migration off disk. The check runs even when Stage 0 produced diffs — a
+sub-recipe gap coexists with real patches, so "diffs exist" is not evidence of a complete run.
+`PluginOutputReader.unresolvedRecipeFailure` owns the marker set; it is anchored on exact upstream
+strings and is therefore version-coupled to the pinned plugin versions in `gradle/libs.versions.toml`.
+
 Path exclusions and plain-text masks are resolved once by `RewriteRunner` and forwarded to Stage 0
 and to the LST fallback so both paths select the same files. Stage 0 also receives the specialized
 owned-set exclusions unconditionally; the specialized pass receives only user/YAML exclusions so it

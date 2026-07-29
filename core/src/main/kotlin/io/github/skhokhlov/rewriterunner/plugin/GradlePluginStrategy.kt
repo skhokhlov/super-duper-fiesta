@@ -78,7 +78,10 @@ internal open class GradlePluginStrategy(
                         )
                     },
                     dryRunFailureMessage = { pluginFailureMessage("Gradle rewriteDryRun", it) },
-                    applyFailureMessage = { pluginFailureMessage("Gradle rewriteRun", it) }
+                    applyFailureMessage = { pluginFailureMessage("Gradle rewriteRun", it) },
+                    unresolvedRecipeFailure = { output ->
+                        PluginOutputReader.unresolvedRecipeFailure(output, "Gradle rewriteDryRun")
+                    }
                 )
             )
         } finally {

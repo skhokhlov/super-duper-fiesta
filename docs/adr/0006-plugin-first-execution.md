@@ -38,6 +38,14 @@ path.
   below), `Failed`, or `Skipped` (no build tool). `Failed` and `Skipped` **fall through
   silently** to the LST pipeline — a plugin that cannot resolve, times out, or finds no build
   tool must never abort the run.
+- **`Success` and `NoChanges` require evidence, not just exit code 0.** A declarative recipe whose
+  `recipeList` names a recipe absent from the plugin's classpath is logged at ERROR and then
+  *survives*: upstream runs the entries it could resolve and exits 0 with real patches. Stage 0
+  therefore inspects captured plugin output for upstream's unresolved-recipe markers after the
+  dry-run and classifies that run as `Failed`, which falls through as above. Since the stages
+  resolve recipe artifacts independently, the LST pipeline may run the whole recipe. The check
+  precedes both the diff check and the apply goal, so a sub-recipe gap is caught whether or not
+  patches were produced and no partial migration reaches disk. See issue #268.
 - **Orphan (root-less monorepo) units.** When the project root has *no* build descriptor,
   Stage 0 no longer gives up. It reuses `discoverBuildUnits` ([ADR 0001](0001-build-unit-classpath-resolution.md))
   to find orphan build units in subdirectories and runs the plugin in each (distinct dir,

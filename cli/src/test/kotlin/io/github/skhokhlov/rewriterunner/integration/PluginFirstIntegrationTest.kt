@@ -14,6 +14,7 @@ import kotlin.io.path.readText
 import kotlin.io.path.writeText
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 class PluginFirstIntegrationTest :
@@ -205,6 +206,65 @@ class PluginFirstIntegrationTest :
             assertEquals(
                 "rewriteDryRun\nrewriteRun\n",
                 projectDir.resolve("wrapper-calls.log").readText()
+            )
+        }
+
+        // #268: the plugin logs an unresolvable recipeList entry at ERROR, runs only the entries
+        // it could resolve, and exits 0 with real patches. Stage 0 must not claim that as a win —
+        // the LST stage resolves recipes from an independent classpath and may run the whole
+        // recipe, so the run has to fall through to it.
+        test(
+            "an unresolved sub-recipe reported by the plugin falls through to the LST stage"
+        ).config(enabled = !isWindows) {
+            val scenario = PluginScenarios.gradleSingleFile
+            scenario.setUpProject(projectDir)
+            val (relPath, afterContent) = scenario.expectedAfterFiles.entries.single()
+            val beforeContent = projectDir.resolve(relPath).readText()
+            projectDir.writeFakeGradlewWithUnresolvedSubRecipe(
+                targetFile = relPath,
+                oldLine = beforeContent.trimEnd('\n'),
+                newLine = afterContent.trimEnd('\n'),
+                newContent = afterContent
+            )
+
+            val runResult =
+                RewriteRunner.builder()
+                    .projectDir(projectDir)
+                    .activeRecipe(scenario.activeRecipe)
+                    .cacheDir(cacheDir)
+                    .build()
+                    .run()
+
+            assertNotEquals(
+                UsedExecutionStage.PLUGIN,
+                runResult.executionDiagnostics.stageUsed,
+                "runResult=$runResult"
+            )
+            // rewriteRun must never have been reached: a partially initialized recipe must not
+            // write a partial migration to disk before the fallback gets its turn.
+            assertEquals(
+                "rewriteDryRun\n",
+                projectDir.resolve("wrapper-calls.log").readText()
+            )
+            // The LST stage resolves com.example.integration.FindAndReplace from rewrite.yaml and
+            // completes the change the plugin never applied. Containment, not an exact key set:
+            // unlike Stage 0 the fallback parses the whole tree, so this FindAndReplace also
+            // rewrites its own `find:` literal inside rewrite.yaml and the fake wrapper script.
+            assertEquals(afterContent, projectDir.resolve(relPath).readText())
+            assertTrue(
+                Path.of(relPath) in runResult.rawDiffs.keys,
+                "rawDiffs=${runResult.rawDiffs.keys}"
+            )
+            // The reason has to survive into diagnostics, naming the recipe that did not resolve.
+            val dryRunAttempt =
+                runResult.executionDiagnostics.executorAttempts.single {
+                    it.executor == LogicalExecutor.GRADLE_PLUGIN
+                }
+            assertEquals(ExecutorPhase.PLUGIN_DRY_RUN, dryRunAttempt.phase)
+            assertEquals(ExecutorOutcome.FAILED, dryRunAttempt.outcome)
+            assertTrue(
+                MISSING_SUB_RECIPE in (dryRunAttempt.message ?: ""),
+                "message=${dryRunAttempt.message}"
             )
         }
 
