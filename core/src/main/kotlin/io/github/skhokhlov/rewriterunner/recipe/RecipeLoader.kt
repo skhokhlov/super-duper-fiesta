@@ -193,24 +193,43 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
     /**
      * Names of recipes that could not be resolved while initializing [recipe].
      *
-     * `DeclarativeRecipe.initialize` does not fail on a `recipeList` entry it cannot find; it
-     * drops the entry and records `recipe '<fqn>' does not exist.` into the validation state that
-     * [org.openrewrite.Recipe.validate] returns. Entries nested inside sub-recipes accumulate onto
-     * the root recipe's validation too, so a single [org.openrewrite.Recipe.validate] call covers
-     * the whole recipe list at any depth.
+     * `DeclarativeRecipe.initialize` does not fail on a recipe-list entry it cannot find; it drops
+     * the entry and records a [org.openrewrite.Validated.Invalid] into the validation state that
+     * [org.openrewrite.Recipe.validate] returns:
      *
-     * Returns an empty list for a healthy recipe, including non-declarative ones (whose default
-     * validation reports option problems that are not this method's concern).
+     * ```java
+     * invalid(name + ".recipeList[" + i + "] (in " + source + ")", recipeFqn, "recipe '…' …", null)
+     * ```
+     *
+     * The unresolved name is therefore available structurally as
+     * [org.openrewrite.Validated.Invalid.getInvalidValue], with the property naming the entry it
+     * came from — no message parsing, so the check does not drift when upstream rewords the text.
+     * Note it is `invalidValue`, not `getValue()`, which throws on an `Invalid`.
+     *
+     * Two properties of upstream this relies on:
+     * - Entries nested inside sub-recipes accumulate onto the **root** recipe's validation, because
+     *   `initializeDeclarativeRecipe` re-initializes a sub-recipe through the outer instance. One
+     *   [org.openrewrite.Recipe.validate] call therefore covers the whole list at any depth.
+     * - The same private helper initializes `preconditions` and hardcodes `.recipeList` in the
+     *   property for both, so an unresolved precondition is reported here too — as it should be.
+     *
+     * Deliberately narrow: only unresolved recipes fail the load (proposed ADR 0011). The
+     * companion `initialization` failure that accompanies a dropped entry, and unrelated option
+     * validations, keep their existing non-fatal behaviour. Filtering on a [String] invalid value
+     * also excludes `YamlResourceLoader`'s malformed-entry failure, which shares the property shape
+     * but carries the offending YAML node rather than a recipe name.
      */
     private fun unresolvedRecipeNames(recipe: Recipe): List<String> = recipe.validate()
         .failures()
-        .mapNotNull { failure ->
-            RECIPE_DOES_NOT_EXIST.find(failure.message.orEmpty())?.groupValues?.get(1)
-        }
+        .filter { failure -> RECIPE_LIST_ENTRY_PROPERTY in failure.property }
+        .mapNotNull { failure -> failure.invalidValue as? String }
         .distinct()
 
     private companion object {
-        /** Matches the marker `DeclarativeRecipe.initialize` records for a missing sub-recipe. */
-        val RECIPE_DOES_NOT_EXIST = Regex("recipe '([^']+)' does not exist")
+        /**
+         * Property fragment upstream builds for a recipe-list (or precondition) entry:
+         * `<recipe name>.recipeList[<index>] (in <source>)`.
+         */
+        const val RECIPE_LIST_ENTRY_PROPERTY = ".recipeList["
     }
 }
