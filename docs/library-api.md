@@ -54,7 +54,9 @@ val result = RewriteRunner.builder()
 > (10 minutes by default), so its timeout must elapse before fallback work can begin.
 
 ### Throws
-- `IllegalArgumentException` — recipe not found in loaded JARs or classpath
+- `IllegalArgumentException` — recipe not found in loaded JARs or classpath, or a requested
+  declarative recipe names a recipe in its `recipeList` that cannot be resolved (running only the
+  entries that did resolve would report success for an incomplete migration)
 - `IllegalStateException` — `activeRecipe` not set when `build()` is called
 
 ### Resource management

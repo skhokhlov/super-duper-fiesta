@@ -178,9 +178,39 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
                     e
                 )
             }
-        require(recipe.recipeList.isNotEmpty() || recipe.name == activeRecipeName) {
-            "Recipe '$activeRecipeName' not found. Verify the recipe name and that the correct recipe JAR is supplied via --recipe-artifact."
+        val unresolved = unresolvedRecipeNames(recipe)
+        require(unresolved.isEmpty()) {
+            "Recipe '$activeRecipeName' could not be fully resolved: " +
+                "${unresolved.joinToString(", ")} " +
+                (if (unresolved.size == 1) "does" else "do") +
+                " not exist. Running only the steps that did resolve would silently produce an " +
+                "incomplete migration. Verify the recipe names and that every recipe JAR they " +
+                "need is supplied via --recipe-artifact."
         }
         return recipe
+    }
+
+    /**
+     * Names of recipes that could not be resolved while initializing [recipe].
+     *
+     * `DeclarativeRecipe.initialize` does not fail on a `recipeList` entry it cannot find; it
+     * drops the entry and records `recipe '<fqn>' does not exist.` into the validation state that
+     * [org.openrewrite.Recipe.validate] returns. Entries nested inside sub-recipes accumulate onto
+     * the root recipe's validation too, so a single [org.openrewrite.Recipe.validate] call covers
+     * the whole recipe list at any depth.
+     *
+     * Returns an empty list for a healthy recipe, including non-declarative ones (whose default
+     * validation reports option problems that are not this method's concern).
+     */
+    private fun unresolvedRecipeNames(recipe: Recipe): List<String> = recipe.validate()
+        .failures()
+        .mapNotNull { failure ->
+            RECIPE_DOES_NOT_EXIST.find(failure.message.orEmpty())?.groupValues?.get(1)
+        }
+        .distinct()
+
+    private companion object {
+        /** Matches the marker `DeclarativeRecipe.initialize` records for a missing sub-recipe. */
+        val RECIPE_DOES_NOT_EXIST = Regex("recipe '([^']+)' does not exist")
     }
 }
