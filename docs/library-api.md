@@ -54,9 +54,13 @@ val result = RewriteRunner.builder()
 > (10 minutes by default), so its timeout must elapse before fallback work can begin.
 
 ### Throws
-- `IllegalArgumentException` — recipe not found in loaded JARs or classpath, or a requested
-  declarative recipe names a recipe in its `recipeList` that cannot be resolved (running only the
-  entries that did resolve would report success for an incomplete migration)
+- `IllegalArgumentException` — the requested recipe could not be loaded in full. Raised when:
+  - a resolved recipe classpath entry is missing, unreadable, or not a readable archive (e.g. a
+    truncated JAR left in the cache) — the message names the offending path; delete it and re-run
+    to fetch a fresh copy;
+  - the recipe is not found in the loaded JARs or on the classpath;
+  - a requested declarative recipe names a recipe in its `recipeList` that cannot be resolved
+    (running only the entries that did resolve would report success for an incomplete migration).
 - `IllegalStateException` — `activeRecipe` not set when `build()` is called
 
 ### Resource management

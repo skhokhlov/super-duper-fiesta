@@ -2,8 +2,12 @@ package io.github.skhokhlov.rewriterunner.recipe
 
 import io.github.skhokhlov.rewriterunner.NoOpRunnerLogger
 import io.kotest.core.spec.style.FunSpec
+import java.nio.channels.FileChannel
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardOpenOption
+import java.util.jar.JarEntry
+import java.util.jar.JarOutputStream
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
@@ -181,5 +185,167 @@ class RecipeLoaderTest :
                     rewriteYamlContent = null
                 )
             assertNotNull(recipe)
+        }
+
+        // ─── Corrupt / unusable recipe JARs (issue #270) ─────────────────────────
+
+        val jarRecipeName = "com.example.test.PackagedInJar"
+
+        fun recipeYaml(name: String) =
+            """
+            ---
+            type: specs.openrewrite.org/v1beta/recipe
+            name: $name
+            displayName: Packaged in JAR
+            description: Declarative recipe shipped inside a recipe JAR.
+            recipeList:
+              - org.openrewrite.FindSourceFiles:
+                  filePattern: "**/*.txt"
+            """.trimIndent()
+
+        fun writeRecipeJar(target: Path): Path {
+            JarOutputStream(Files.newOutputStream(target)).use { out ->
+                out.putNextEntry(JarEntry("META-INF/rewrite/test-recipes.yml"))
+                out.write(recipeYaml(jarRecipeName).toByteArray(Charsets.UTF_8))
+                out.closeEntry()
+            }
+            return target
+        }
+
+        test("load activates a declarative recipe packaged in a readable recipe JAR") {
+            // Positive control for the readability probe: a well-formed JAR must still load.
+            val jar = writeRecipeJar(tempDir.resolve("good-recipe.jar"))
+            RecipeLoader(NoOpRunnerLogger).use { loader ->
+                val recipe =
+                    loader.load(
+                        recipeJars = listOf(jar),
+                        activeRecipeName = jarRecipeName,
+                        rewriteYaml = null as Path?
+                    )
+                assertEquals(jarRecipeName, recipe.name)
+            }
+        }
+
+        test("load fails and names the file when a recipe JAR is truncated") {
+            // Regression for #270: a truncated JAR in the recipe cache used to yield zero
+            // recipes with no warning anywhere — upstream ClasspathScanningLoader swallows
+            // the IOException — so the run failed with a misleading "recipe not found".
+            val jar = writeRecipeJar(tempDir.resolve("truncated-recipe.jar"))
+            FileChannel.open(jar, StandardOpenOption.WRITE).use { it.truncate(64) }
+
+            val ex =
+                runCatching {
+                    RecipeLoader(NoOpRunnerLogger).use { loader ->
+                        loader.load(
+                            recipeJars = listOf(jar),
+                            activeRecipeName = jarRecipeName,
+                            rewriteYaml = null as Path?
+                        )
+                    }
+                }.exceptionOrNull()
+
+            assertNotNull(ex, "A truncated recipe JAR must fail the run, not load zero recipes")
+            val msg = ex.message ?: ""
+            assertTrue(
+                msg.contains("truncated-recipe.jar"),
+                "Failure must name the offending JAR; got: $msg"
+            )
+            // Covers both downstream diagnoses, which name the requested recipe in this
+            // exact form: the RecipeException conversion ("Recipe 'X' not found.") and the
+            // unresolved-recipe check from #269 ("Recipe 'X' could not be fully resolved").
+            assertTrue(
+                !msg.contains("Recipe '$jarRecipeName'"),
+                "Failure must blame the corrupt JAR, not the recipe name; got: $msg"
+            )
+        }
+
+        test("a corrupt JAR is blamed as such even when a rewrite.yaml composes its recipes") {
+            // Ordering guard for the #270 probe against the #269 unresolved-recipe check.
+            // Both live in buildAndActivate — the probe at the top, the validation at the
+            // bottom — and both are correct diagnoses of their own condition, so whichever
+            // runs first decides what the user is told. A rewrite.yaml whose recipeList
+            // references a recipe from a corrupt JAR would otherwise be reported as
+            // "could not be fully resolved: <recipe> does not exist", blaming the recipe
+            // names and never mentioning the unreadable file that actually caused it.
+            val jar = writeRecipeJar(tempDir.resolve("composed-recipe.jar"))
+            FileChannel.open(jar, StandardOpenOption.WRITE).use { it.truncate(64) }
+
+            val composingYaml =
+                """
+                ---
+                type: specs.openrewrite.org/v1beta/recipe
+                name: com.example.test.NeedsTheJar
+                displayName: Needs the JAR
+                description: Composes a recipe that only the recipe JAR supplies.
+                recipeList:
+                  - $jarRecipeName
+                """.trimIndent()
+
+            val ex =
+                runCatching {
+                    RecipeLoader(NoOpRunnerLogger).use { loader ->
+                        loader.load(
+                            recipeJars = listOf(jar),
+                            activeRecipeName = "com.example.test.NeedsTheJar",
+                            rewriteYamlContent = composingYaml
+                        )
+                    }
+                }.exceptionOrNull()
+
+            assertNotNull(ex, "A corrupt recipe JAR must fail the run")
+            val msg = ex.message ?: ""
+            assertTrue(
+                msg.contains("composed-recipe.jar"),
+                "Failure must name the unreadable JAR, not just the recipes it should have " +
+                    "supplied; got: $msg"
+            )
+            assertTrue(
+                !msg.contains("could not be fully resolved"),
+                "The corrupt JAR must be reported as the root cause, not as unresolved " +
+                    "recipe names; got: $msg"
+            )
+        }
+
+        test("load fails and names the file when a recipe JAR path does not exist") {
+            val missing = tempDir.resolve("never-downloaded.jar")
+
+            val ex =
+                runCatching {
+                    RecipeLoader(NoOpRunnerLogger).use { loader ->
+                        loader.load(
+                            recipeJars = listOf(missing),
+                            activeRecipeName = jarRecipeName,
+                            rewriteYaml = null as Path?
+                        )
+                    }
+                }.exceptionOrNull()
+
+            assertNotNull(ex, "A missing recipe JAR must fail the run")
+            assertTrue(
+                (ex.message ?: "").contains("never-downloaded.jar"),
+                "Failure must name the missing JAR; got: ${ex.message}"
+            )
+        }
+
+        test("load accepts a directory classpath entry") {
+            // ClasspathScanningLoader supports directories of class files / resources,
+            // so the readability probe must not reject them as "not an archive".
+            val dir = tempDir.resolve("exploded-recipe")
+            val rewriteDir = dir.resolve("META-INF/rewrite")
+            Files.createDirectories(rewriteDir)
+            Files.writeString(
+                rewriteDir.resolve("test-recipes.yml"),
+                recipeYaml(jarRecipeName)
+            )
+
+            RecipeLoader(NoOpRunnerLogger).use { loader ->
+                val recipe =
+                    loader.load(
+                        recipeJars = listOf(dir),
+                        activeRecipeName = jarRecipeName,
+                        rewriteYaml = null as Path?
+                    )
+                assertEquals(jarRecipeName, recipe.name)
+            }
         }
     })

@@ -4,12 +4,16 @@ import io.github.skhokhlov.rewriterunner.NoOpRunnerLogger
 import io.github.skhokhlov.rewriterunner.RunnerLogger
 import java.io.ByteArrayInputStream
 import java.io.FileInputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.URI
 import java.net.URLClassLoader
 import java.nio.file.Path
 import java.util.Properties
+import java.util.jar.JarFile
 import kotlin.io.path.exists
+import kotlin.io.path.isDirectory
+import kotlin.io.path.isReadable
 import org.openrewrite.Recipe
 import org.openrewrite.RecipeException
 import org.openrewrite.config.ClasspathScanningLoader
@@ -115,11 +119,66 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
 
     private data class YamlSource(val stream: () -> InputStream, val uri: URI)
 
+    /**
+     * Reject unreadable recipe classpath entries *before* they reach OpenRewrite's scanner.
+     *
+     * OpenRewrite's `ClasspathScanningLoader` opens every regular classpath entry with
+     * `new JarFile(...)` and swallows the resulting `IOException`, so a truncated or
+     * otherwise corrupt JAR silently contributes zero recipes. Combined with
+     * `CHECKSUM_POLICY_IGNORE` on the resolver session (a deliberate choice for corporate
+     * proxies that omit checksum files) and `UPDATE_POLICY_DAILY`, a half-written JAR in
+     * the local cache survives indefinitely and can only be inferred from a downstream
+     * symptom: a misleading "Recipe '…' not found", or — when a `rewrite.yaml` composes
+     * recipes the corrupt JAR was supposed to supply — the unresolved-recipe failure
+     * raised by [unresolvedRecipeNames], which blames the recipe names rather than the file.
+     *
+     * This probe mirrors exactly what the scanner will do — directories are scanned as
+     * exploded class/resource trees and are therefore accepted as-is; every regular file
+     * must open as a ZIP/JAR archive — and fails loudly, naming the offending path.
+     *
+     * It must stay the **first** statement of [buildAndActivate]: both downstream failures
+     * above are real diagnoses of their own conditions, so whichever check runs first
+     * decides which cause the user is told about, and the corrupt file is the root cause.
+     */
+    private fun verifyReadableArchives(recipeJars: List<Path>) {
+        for (jar in recipeJars) {
+            val problem = archiveProblem(jar) ?: continue
+            val message =
+                "Recipe classpath entry is unusable: $jar ($problem). " +
+                    "The cached artifact is missing or corrupt — delete it and re-run to " +
+                    "fetch a fresh copy."
+            logger.error(message)
+            throw IllegalArgumentException(message)
+        }
+    }
+
+    /**
+     * @return a human-readable description of why [entry] cannot be scanned, or `null`
+     *   when it is usable.
+     */
+    private fun archiveProblem(entry: Path): String? {
+        // ClasspathScanningLoader walks directories of class files / META-INF resources,
+        // so an exploded classpath entry is legitimate and needs no archive probe.
+        if (entry.isDirectory()) return null
+        if (!entry.exists()) return "file does not exist"
+        if (!entry.isReadable()) return "file is not readable"
+        return try {
+            // The JarFile constructor reads the ZIP central directory, which is precisely
+            // the structure a truncated download destroys.
+            JarFile(entry.toFile()).use { it.entries() }
+            null
+        } catch (e: IOException) {
+            "not a readable archive: ${e.message ?: e.javaClass.simpleName}"
+        }
+    }
+
     private fun buildAndActivate(
         recipeJars: List<Path>,
         activeRecipeName: String,
         yamlSource: YamlSource?
     ): Recipe {
+        verifyReadableArchives(recipeJars)
+
         val props = Properties()
         val parentLoader = Thread.currentThread().contextClassLoader
 
@@ -138,26 +197,26 @@ class RecipeLoader(val logger: RunnerLogger) : AutoCloseable {
 
         val builder = Environment.builder()
 
-        // Scan each recipe JAR for OpenRewrite recipes/styles/categories
+        // Scan each recipe JAR for OpenRewrite recipes/styles/categories.
+        //
+        // No try/catch here on purpose: the 4-arg ClasspathScanningLoader constructor only
+        // stores lambdas and performs no I/O, so a guard around it would catch nothing —
+        // the actual scan runs lazily inside Environment.activateRecipes(), well outside
+        // any block we could wrap here. Unreadable archives are rejected up-front by
+        // verifyReadableArchives() instead; see [verifyReadableArchives].
         for (jar in recipeJars) {
             logger.debug("Scanning recipe JAR: $jar")
-            try {
-                builder.load(ClasspathScanningLoader(jar, props, emptyList(), classLoader))
-            } catch (e: Exception) {
-                logger.warn("Failed to scan recipe JAR $jar (skipping): ${e.message}")
-            }
+            builder.load(ClasspathScanningLoader(jar, props, emptyList(), classLoader))
         }
 
         // Scan the tool's own classpath for built-in recipes only when no recipe JARs are provided.
         // When recipe JARs are present their transitive deps already include all OpenRewrite core
         // jars, so a blanket classpath scan would register the same recipes twice and cause
         // duplicate-key errors in Environment.activateRecipes().
+        // (Same reasoning as above: the 2-arg constructor performs no I/O either, so a
+        // try/catch around it could never fire.)
         if (recipeJars.isEmpty()) {
-            try {
-                builder.load(ClasspathScanningLoader(props, classLoader))
-            } catch (e: Exception) {
-                logger.warn("Failed to scan tool classpath (skipping): ${e.message}")
-            }
+            builder.load(ClasspathScanningLoader(props, classLoader))
         }
 
         // Load rewrite.yaml if provided
