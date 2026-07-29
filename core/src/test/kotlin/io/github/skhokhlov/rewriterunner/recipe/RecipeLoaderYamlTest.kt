@@ -178,6 +178,43 @@ class RecipeLoaderYamlTest :
             )
         }
 
+        test("load fails when a precondition names a recipe that does not exist") {
+            // Upstream initializes `preconditions` through the same helper as `recipeList` and
+            // drops unresolvable entries the same way.  A precondition that silently disappears
+            // widens the recipe's scope, so it is an unresolved recipe like any other.
+            val yamlFile = tempDir.resolve("rewrite.yaml")
+            yamlFile.writeText(
+                """
+                ---
+                type: specs.openrewrite.org/v1beta/recipe
+                name: com.example.test.GuardedRecipe
+                preconditions:
+                  - com.example.test.MissingPrecondition
+                recipeList:
+                  - org.openrewrite.FindSourceFiles:
+                      filePattern: "**/*.txt"
+                """.trimIndent()
+            )
+
+            val result = runCatching {
+                RecipeLoader(NoOpRunnerLogger).load(
+                    recipeJars = emptyList(),
+                    activeRecipeName = "com.example.test.GuardedRecipe",
+                    rewriteYaml = yamlFile
+                )
+            }
+
+            val ex = result.exceptionOrNull()
+            assertTrue(
+                ex is IllegalArgumentException,
+                "Expected IllegalArgumentException; got ${ex?.javaClass?.name}: ${ex?.message}"
+            )
+            assertTrue(
+                (ex.message ?: "").contains("com.example.test.MissingPrecondition"),
+                "Message should name the unresolved precondition: ${ex.message}"
+            )
+        }
+
         test("load succeeds when every recipeList entry resolves") {
             // Guard against the validation check rejecting a healthy declarative recipe.
             val yamlFile = tempDir.resolve("rewrite.yaml")
