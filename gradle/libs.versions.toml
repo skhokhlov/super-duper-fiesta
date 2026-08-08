@@ -14,7 +14,7 @@ dokka = "2.2.0"
 com-vanniktech-maven-publish-gradle-plugin = "0.37.0"
 cyclonedx-gradle-plugin = "3.3.0"
 rewrite-gradle-plugin = "7.32.1"
-rewrite-maven-plugin = "6.44.0"
+rewrite-maven-plugin = "6.45.0"
 
 [libraries]
 picocli = { group = "info.picocli", name = "picocli", version.ref = "picocli" }
