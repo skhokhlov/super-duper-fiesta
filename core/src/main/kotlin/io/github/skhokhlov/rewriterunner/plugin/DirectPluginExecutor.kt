@@ -16,7 +16,18 @@ internal data class DirectPluginInvocation(
     val patchFiles: () -> List<DirectPluginPatchFile>,
     val estimatedTimeSaved: (String) -> Duration?,
     val dryRunFailureMessage: (Int?) -> String,
-    val applyFailureMessage: (Int?) -> String
+    val applyFailureMessage: (Int?) -> String,
+    /**
+     * Verdict on captured plugin output: a failure reason when the build tool reported that it
+     * could not resolve a recipe it was asked to run, `null` when it reported no such gap.
+     *
+     * Per-strategy, mirroring [estimatedTimeSaved], so tool-specific wording (and, should the
+     * plugins ever diverge, tool-specific markers) stays with the strategy that owns the tool.
+     * Both strategies currently delegate to [PluginOutputReader.unresolvedRecipeFailure] because
+     * the markers originate in shared rewrite-core code and are byte-identical across the two
+     * plugins; duplicating the literals per tool would only invite drift.
+     */
+    val unresolvedRecipeFailure: (String) -> String?
 )
 
 /**
@@ -53,6 +64,24 @@ internal class DirectPluginExecutor(
                 phase = ExecutorPhase.PLUGIN_DRY_RUN,
                 durationMillis = dryRunDurationMillis,
                 outcome = failureOutcome(dryRunExit, message),
+                exitCode = dryRunExit,
+                message = message
+            )
+            return PluginRunResult.Failed(message)
+        }
+
+        // Exit 0 is not evidence that the plugin ran the whole recipe: a declarative recipe whose
+        // recipeList names a missing recipe logs the gap at ERROR, runs the entries it could
+        // resolve, and still exits 0 with real patches. Verify the stage's own success from the
+        // captured output instead of trusting the exit code, and do it before the diff check so a
+        // gap is caught whether or not patches were produced. Failing here (rather than after
+        // apply) also keeps a partial migration off disk; the caller falls through to the LST
+        // stage, whose recipe classpath is resolved independently and may hold what was missing.
+        invocation.unresolvedRecipeFailure(pluginOutput.toString())?.let { message ->
+            record(
+                phase = ExecutorPhase.PLUGIN_DRY_RUN,
+                durationMillis = dryRunDurationMillis,
+                outcome = ExecutorOutcome.FAILED,
                 exitCode = dryRunExit,
                 message = message
             )

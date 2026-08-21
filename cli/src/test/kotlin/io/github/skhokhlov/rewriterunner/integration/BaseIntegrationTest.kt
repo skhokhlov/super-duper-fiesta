@@ -204,6 +204,59 @@ fun Path.writeFakeGradlewWithHeaderOnlyDataTablesAndEstimate(
 }
 
 /**
+ * Fully-qualified name of the sub-recipe the fake wrappers report as unresolvable.
+ * Shared with the assertions so the marker text and the expectation cannot drift apart.
+ */
+const val MISSING_SUB_RECIPE = "com.example.TotallyMissingRecipe"
+
+/**
+ * Writes a fake `gradlew` that reproduces the upstream "missing sub-recipe" degradation from #268:
+ * `rewriteDryRun` logs the validation errors at ERROR, still writes a real patch, and **exits 0**.
+ *
+ * The literals below are the exact strings emitted by `DeclarativeRecipe` (rewrite-core) and
+ * `DefaultProjectParser` (rewrite-gradle-plugin) for a `recipeList` entry that is not on the
+ * plugin's classpath. `rewriteRun` remains functional on purpose: if Stage 0 ever stops failing
+ * on these markers, the apply goal runs and `wrapper-calls.log` records it.
+ */
+fun Path.writeFakeGradlewWithUnresolvedSubRecipe(
+    targetFile: String,
+    oldLine: String,
+    newLine: String,
+    newContent: String
+) {
+    val printfContent = newContent.replace("\n", "\\n")
+    val gradlew = resolve("gradlew")
+    gradlew.writeText(
+        """
+        #!/bin/sh
+        LOG="$D(cd "$D(dirname "${D}0")" && pwd)/wrapper-calls.log"
+        if [ "${D}1" = "rewriteDryRun" ]; then
+          echo "${D}1" >> "${D}LOG"
+          mkdir -p build/reports/rewrite
+          cat > build/reports/rewrite/rewrite.patch <<'PATCH'
+        diff --git a/$targetFile b/$targetFile
+        --- a/$targetFile
+        +++ b/$targetFile
+        @@ -1 +1 @@
+        -$oldLine
+        +$newLine
+        PATCH
+          echo "Recipe validation error in com.example.Composite for property com.example.Composite.recipeList[1]: recipe '$MISSING_SUB_RECIPE' does not exist."
+          echo "Recipe validation errors detected as part of one or more activeRecipe(s). Execution will continue regardless."
+          exit 0
+        fi
+        if [ "${D}1" = "rewriteRun" ]; then
+          echo "${D}1" >> "${D}LOG"
+          printf '$printfContent' > $targetFile
+          exit 0
+        fi
+        exit 1
+        """.trimIndent()
+    )
+    if (!isWindows) Files.setPosixFilePermissions(gradlew, posixExecutable)
+}
+
+/**
  * Writes a fake `gradlew` that validates the generated init script contains every
  * [requiredExclusions] entry before simulating a single-file plugin change.
  */

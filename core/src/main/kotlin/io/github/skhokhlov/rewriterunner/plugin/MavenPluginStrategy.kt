@@ -100,7 +100,10 @@ internal open class MavenPluginStrategy(
                         )
                     },
                     dryRunFailureMessage = { pluginFailureMessage("Maven rewrite:dryRun", it) },
-                    applyFailureMessage = { pluginFailureMessage("Maven rewrite:run", it) }
+                    applyFailureMessage = { pluginFailureMessage("Maven rewrite:run", it) },
+                    unresolvedRecipeFailure = { output ->
+                        PluginOutputReader.unresolvedRecipeFailure(output, "Maven rewrite:dryRun")
+                    }
                 )
             )
         } finally {
